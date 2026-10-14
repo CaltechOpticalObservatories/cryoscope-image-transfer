@@ -2,7 +2,8 @@
 #
 # setup.sh -- install and configure one Cryoscope machine.
 #
-# Run from the directory holding site.conf, role and check.sh.
+# Run from the directory holding site.conf, role and check.sh, with the
+# programs and unit files it installs in bin/ and units/ beside them.
 #
 # Installs the transfer layer and the notification layer.
 
@@ -53,6 +54,14 @@ install_file() {
     return 0
 }
 
+# install_src MODE NAME PATH -- install_file from $SRCDIR/NAME. A missing source
+# would otherwise fail the redirect and be reported as unchanged.
+install_src() {
+    [ -s "$SRCDIR/$2" ] || die "$2 is missing or empty in $SRCDIR.
+       Copy the whole pipeline directory and run setup.sh from there."
+    install_file "$1" "$3" < "$SRCDIR/$2"
+}
+
 # ------------------------------------------------------------ preconditions --
 
 step "Preconditions"
@@ -88,7 +97,7 @@ if [ "$SRCDIR" = /usr/local/bin ] || [ "$SRCDIR" = /usr/bin ]; then
 fi
 for f in $CONFFILE role check.sh; do
     [ -f "$SRCDIR/$f" ] || die "$f is not in $SRCDIR, beside setup.sh.
-       All four files must sit in one directory and setup.sh is run from there."
+       Copy the whole pipeline directory and run setup.sh from there."
 done
 ok "$CONFFILE, role and check.sh found beside setup.sh"
 
@@ -333,50 +342,11 @@ fi
 
 step "Notification emitter"
 
-if install_file 755 /usr/local/bin/notify-images.sh <<'EOF'
-#!/bin/bash
-# Emit IMAGE_COMPLETE on the multicast group when the camera renames a
-# completed FITS file into place. Fire and forget: no listener can stall it.
-#
-# The camera writes into dated subdirectories, /images/YYYYMMDD/, so the watch
-# is recursive. inotifywait adds a watch for each directory created while it is
-# running, so the nightly rollover needs no restart.
-#
-# The name emitted is the path relative to IMAGE_DIR, for example
-# 20260828/img_0001.fits. It is one whitespace-free token, so the wire format
-# is unchanged, and a consumer appends it to the server root to build a URL.
-. /etc/cryoscope/site.conf
-
-inotifywait -m -q -r -e moved_to --format '%w%f' "$IMAGE_DIR/" | while read -r p; do
-  case "$p" in
-    *.fits) ;;
-    *) continue ;;
-  esac
-  # Strip the image root, leaving the path the archive is keyed by.
-  rel=${p#"$IMAGE_DIR"/}
-  printf 'IMAGE_COMPLETE %s %s\n' "$rel" "$(date +%s.%3N)" \
-    > "/dev/udp/$MCAST_GROUP/$MCAST_PORT"
-done
-EOF
+if install_src 755 bin/notify-images.sh /usr/local/bin/notify-images.sh
 then ok "wrote /usr/local/bin/notify-images.sh"; mark_changed notify-images
 else ok "notify-images.sh unchanged"; fi
 
-if install_file 644 /etc/systemd/system/notify-images.service <<'EOF'
-[Unit]
-Description=Multicast notification of completed FITS images
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=user
-ExecStart=/usr/local/bin/notify-images.sh
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+if install_src 644 units/notify-images.service /etc/systemd/system/notify-images.service
 then ok "wrote notify-images.service"; mark_changed notify-images
 else ok "notify-images.service unchanged"; fi
 
@@ -528,110 +498,21 @@ fi
 
 step "Transfer"
 
-if install_file 755 /usr/local/bin/pull-images.sh <<'EOF'
-#!/bin/bash
-# The 3 second polling pull. The floor beneath the trigger: if the trigger
-# dies, latency degrades to 3 seconds rather than to nothing.
-#
-# Prohibited flags:
-#   --delete            would destroy the archive; cryocontrol is cleared by
-#                       design
-#   --inplace --append  defeat the atomic rename; a partial file becomes
-#                       visible to readers
-. /etc/cryoscope/site.conf
-
-while true; do
-  flock -n "$LOCK_DIR/pull.lock" \
-    rsync -a --partial-dir=.rsync-tmp --exclude='*.writing' \
-      "cryocontrol:$IMAGE_DIR/" "$INCOMING_DIR/"
-  sleep 3
-done
-EOF
+if install_src 755 bin/pull-images.sh /usr/local/bin/pull-images.sh
 then ok "wrote /usr/local/bin/pull-images.sh"; mark_changed pull-images
 else ok "pull-images.sh unchanged"; fi
 
-if install_file 644 /etc/systemd/system/pull-images.service <<'EOF'
-[Unit]
-Description=Pull FITS images from the acquisition computer
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=user
-ExecStart=/usr/local/bin/pull-images.sh
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
+if install_src 644 units/pull-images.service /etc/systemd/system/pull-images.service
 then ok "wrote pull-images.service"; mark_changed pull-images
 else ok "pull-images.service unchanged"; fi
 
 step "Triggered pull"
 
-if install_file 755 /usr/local/bin/trigger-pull.sh <<'EOF'
-#!/bin/bash
-# Listen for IMAGE_COMPLETE, pull the one named file, announce it.
-#
-# ip-add-membership takes an interface name, never an address; the address
-# form fails with ENODEV. IFACE is derived per machine by setup.sh.
-#
-# The name is a path relative to the image root, such as
-# 20260828/img_0001.fits. rsync --relative reproduces that path under
-# INCOMING_DIR, so this writes into the same tree the 3 second poll builds. A
-# flat copy would create a second, colliding copy of every image.
-. /etc/cryoscope/site.conf
-. /etc/cryoscope/machine.conf
-
-socat -u "UDP4-RECV:$MCAST_PORT,ip-add-membership=$MCAST_GROUP:$IFACE,reuseaddr" - |
-while read -r tag name ts; do
-  # Ignore our own IMAGE_AVAILABLE datagrams when they loop back.
-  [ "$tag" = "IMAGE_COMPLETE" ] || continue
-  case "$name" in
-    *.fits) ;;
-    *) continue ;;
-  esac
-  # Reject anything that would write outside INCOMING_DIR. The name arrives
-  # over an unauthenticated datagram and is used as a path.
-  case "$name" in
-    /*|*..*) echo "REJECTED $name" | logger -t trigger-pull; continue ;;
-  esac
-  # -w 5 rather than -n: the lock is held briefly for one file, so waiting
-  # beats dropping it. On timeout the 3 second loop collects it.
-  if flock -w 5 "$LOCK_DIR/pull.lock" rsync -a --relative --partial-dir=.rsync-tmp \
-       "cryocontrol:$IMAGE_DIR/./$name" "$INCOMING_DIR/" ; then
-    printf 'IMAGE_AVAILABLE %s http://%s:%s/%s\n' \
-      "$name" "$(hostname)" "$HTTP_PORT" "$name" \
-      > "/dev/udp/$MCAST_GROUP/$MCAST_PORT"
-    now=$(date +%s.%3N)
-    echo "$name $(awk -v a="$now" -v b="$ts" 'BEGIN{printf "%.3f", a-b}')" \
-      | logger -t trigger-pull
-  else
-    echo "FAILED $name" | logger -t trigger-pull
-  fi
-done
-EOF
+if install_src 755 bin/trigger-pull.sh /usr/local/bin/trigger-pull.sh
 then ok "wrote /usr/local/bin/trigger-pull.sh"; mark_changed trigger-pull
 else ok "trigger-pull.sh unchanged"; fi
 
-if install_file 644 /etc/systemd/system/trigger-pull.service <<'EOF'
-[Unit]
-Description=Triggered pull of FITS images on multicast notification
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=user
-ExecStart=/usr/local/bin/trigger-pull.sh
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+if install_src 644 units/trigger-pull.service /etc/systemd/system/trigger-pull.service
 then ok "wrote trigger-pull.service"; mark_changed trigger-pull
 else ok "trigger-pull.service unchanged"; fi
 

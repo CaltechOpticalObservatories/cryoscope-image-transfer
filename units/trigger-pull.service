@@ -1,0 +1,14 @@
+[Unit]
+Description=Triggered pull of FITS images on multicast notification
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+ExecStart=/usr/local/bin/trigger-pull.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
