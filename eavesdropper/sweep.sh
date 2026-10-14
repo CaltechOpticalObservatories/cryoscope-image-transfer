@@ -43,8 +43,8 @@ mkdir -p "$DEST"
 # Emits one "type name" line per entry.
 list_json() {
   curl -s -m 20 "$1" \
-    | grep -o '"name":"[^"]*","type":"[^"]*"' \
-    | sed 's/"name":"\(.*\)","type":"\(.*\)"/\2 \1/'
+    | grep -o '"name":"[^"]*", *"type":"[^"]*"' \
+    | sed 's/"name":"\(.*\)", *"type":"\(.*\)"/\2 \1/'
 }
 
 fetch_one() {           # fetch_one RELATIVE_PATH

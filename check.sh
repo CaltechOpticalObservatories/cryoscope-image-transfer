@@ -299,10 +299,15 @@ else
         fail "nginx serving on $MY_IP:$HTTP_PORT" "curl -v http://$MY_IP:$HTTP_PORT/"
     fi
 
-    if curl -s -m 5 "http://$MY_IP:$HTTP_PORT/" 2>/dev/null | head -c 1 | grep -q '\['; then
-        pass "autoindex is JSON"
+    # The sweep reads the listing with this pattern (eavesdropper/sweep.sh).
+    # Every entry must match it, or the sweep skips that entry without a word.
+    LISTING=$(curl -s -m 5 "http://$MY_IP:$HTTP_PORT/" 2>/dev/null)
+    NENTRY=$(printf '%s' "$LISTING" | grep -o '"name":' | wc -l)
+    NPARSE=$(printf '%s' "$LISTING" | grep -o '"name":"[^"]*", *"type":"[^"]*"' | wc -l)
+    if [ "${LISTING:0:1}" = "[" ] && [ "$NENTRY" -eq "$NPARSE" ]; then
+        pass "autoindex is JSON" "$NPARSE of $NENTRY entries parse as the sweep reads them"
     else
-        fail "autoindex is JSON" "the reconciliation sweep parses this"
+        fail "autoindex is JSON" "$NPARSE of $NENTRY entries parse; the reconciliation sweep reads this"
     fi
 
     # Without the space in "location ~ /\." this returns 200 and staging
