@@ -164,7 +164,7 @@ fi
 . "$CONF"
 
 for v in CRYOCONTROL_IP CONCORDIA1_IP CONCORDIA2_IP MCAST_GROUP MCAST_PORT \
-         HTTP_PORT IMAGE_DIR INCOMING_DIR MANIFEST_DIR LOCK_DIR; do
+         HTTP_PORT IMAGE_DIR INCOMING_DIR MANIFEST_DIR LOCK_DIR ACQ_MANIFEST; do
     eval "val=\${$v:-}"
     [ -n "$val" ] || die "$v is empty in $CONF."
 done
@@ -349,6 +349,25 @@ else ok "notify-images.sh unchanged"; fi
 if install_src 644 units/notify-images.service /etc/systemd/system/notify-images.service
 then ok "wrote notify-images.service"; mark_changed notify-images
 else ok "notify-images.service unchanged"; fi
+
+step "Hash manifest"
+
+ACQ_DIR=$(dirname "$ACQ_MANIFEST")
+if [ -d "$ACQ_DIR" ]; then
+    ok "$ACQ_DIR exists"
+else
+    sudo install -d -o user -g user -m 755 "$ACQ_DIR" || die "could not create $ACQ_DIR"
+    ok "created $ACQ_DIR"
+fi
+[ -w "$ACQ_DIR" ] || die "$ACQ_DIR is not writable by user."
+
+if install_src 755 bin/acq-hash.sh /usr/local/bin/acq-hash.sh
+then ok "wrote /usr/local/bin/acq-hash.sh"; mark_changed acq-hash
+else ok "acq-hash.sh unchanged"; fi
+
+if install_src 644 units/acq-hash.service /etc/systemd/system/acq-hash.service
+then ok "wrote acq-hash.service"; mark_changed acq-hash
+else ok "acq-hash.service unchanged"; fi
 
 fi
 
@@ -656,6 +675,9 @@ if [ "$MACHINE_ROLE" = emitter ]; then
     sudo systemctl enable --now notify-images >/dev/null 2>&1 \
         || die "notify-images failed to start. journalctl -u notify-images -n 20"
     ok "notify-images enabled and running"
+    sudo systemctl enable --now acq-hash >/dev/null 2>&1 \
+        || die "acq-hash failed to start. journalctl -u acq-hash -n 20"
+    ok "acq-hash enabled and running"
 fi
 
 if [ "$MACHINE_ROLE" = data ]; then

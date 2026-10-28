@@ -1,0 +1,14 @@
+[Unit]
+Description=SHA-256 manifest of completed FITS images
+
+[Service]
+Type=simple
+User=user
+ExecStart=/usr/local/bin/acq-hash.sh
+Restart=always
+RestartSec=5
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
