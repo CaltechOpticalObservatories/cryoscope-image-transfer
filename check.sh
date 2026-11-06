@@ -22,6 +22,15 @@ fail() { printf 'FAIL  %-34s %s\n' "$1" "${2:-}"; FAIL=$((FAIL+1)); }
 skip() { printf 'SKIP  %-34s %s\n' "$1" "${2:-}"; SKIP=$((SKIP+1)); }
 head_() { printf '\n--- %s\n' "$1"; }
 
+# unhashed DIR MANIFEST -- the number of images in DIR more than two minutes
+# old that are not in MANIFEST. The hash writers scan every 30 seconds, and
+# dotted paths are rsync's temporary files.
+unhashed() {
+    LC_ALL=C comm -23 \
+        <(find "$1" -name '.*' -prune -o -type f -name '*.fits' -mmin +2 -printf '%P\n' | LC_ALL=C sort) \
+        <(cut -d ' ' -f 1 "$2" | LC_ALL=C sort) | wc -l
+}
+
 DO_TRANSFER=0
 [ "${1:-}" = "--transfer" ] && DO_TRANSFER=1
 
@@ -157,6 +166,110 @@ else
     pass "notify-images stable" "${NRESTART:-0} restarts"
 fi
 
+head_ "Hash manifest"
+
+if systemctl is-enabled --quiet acq-hash 2>/dev/null; then
+    pass "acq-hash enabled"
+else
+    fail "acq-hash enabled" "sudo systemctl enable --now acq-hash"
+fi
+if systemctl is-active --quiet acq-hash 2>/dev/null; then
+    pass "acq-hash running"
+else
+    fail "acq-hash running" "journalctl -u acq-hash -n 20 --no-pager"
+fi
+
+if [ -f "$ACQ_MANIFEST" ]; then
+    N=$(unhashed "$IMAGE_DIR" "$ACQ_MANIFEST")
+    if [ "$N" -eq 0 ]; then
+        pass "every image hashed" "$(wc -l < "$ACQ_MANIFEST") lines in $ACQ_MANIFEST"
+    else
+        fail "every image hashed" "$N older than 2 minutes not in $ACQ_MANIFEST. After downtime
+                                   acq-hash is catching up; run this again in a few minutes."
+    fi
+else
+    fail "every image hashed" "no $ACQ_MANIFEST. Re-run setup.sh."
+fi
+
+head_ "Retention"
+
+RECORDS=$(dirname "$ACQ_MANIFEST")
+
+if systemctl is-enabled --quiet reaper.timer 2>/dev/null; then
+    pass "reaper.timer enabled"
+else
+    fail "reaper.timer enabled" "sudo systemctl enable --now reaper.timer"
+fi
+if systemctl is-active --quiet reaper.timer 2>/dev/null; then
+    pass "reaper.timer waiting"
+else
+    fail "reaper.timer waiting" "systemctl status reaper.timer"
+fi
+
+# The reaper runs for seconds every 10 minutes, so its unit is inactive nearly
+# always. Its last result is what shows whether it works.
+if [ -z "$(systemctl show reaper -p ExecMainExitTimestamp --value 2>/dev/null)" ]; then
+    skip "reaper last pass" "none yet; the first is 5 minutes after boot"
+elif [ "$(systemctl show reaper -p Result --value 2>/dev/null)" = success ]; then
+    pass "reaper last pass" "succeeded"
+else
+    fail "reaper last pass" "journalctl -u reaper -n 20 --no-pager"
+fi
+LAST=$(journalctl -t reaper --since '-1 hour' -o cat --no-pager 2>/dev/null | grep '% used;' | tail -1)
+[ -n "$LAST" ] && printf 'NOTE  %-34s %s\n' "reaper last summary" "$LAST"
+
+if [ "$ON_LAN" -eq 0 ]; then
+    skip "concordia manifest reachable" "not on the instrument LAN"
+else
+    FROM=""
+    for ip in "$CONCORDIA1_IP" "$CONCORDIA2_IP"; do
+        curl -s -f -I -m 5 "http://$ip:$HTTP_PORT/manifests/data.manifest" >/dev/null 2>&1 \
+            && FROM="$FROM $ip"
+    done
+    if [ -n "$FROM" ]; then
+        pass "concordia manifest reachable" "from$FROM"
+    else
+        fail "concordia manifest reachable" "no concordia answers, so no copy is verified and nothing is deleted"
+    fi
+fi
+
+# A name recorded here is never deleted, so the image stays until its two
+# copies are compared by hand.
+NMIS=$(grep -c . "$RECORDS/mismatch.txt" 2>/dev/null || true)
+if [ "${NMIS:-0}" -eq 0 ]; then
+    pass "no hash mismatches"
+else
+    fail "no hash mismatches" "$NMIS in $RECORDS/mismatch.txt. Those images are kept;
+                                   compare each with its copy on the concordia."
+fi
+
+# Deletion runs as user, which must be able to write each directory holding
+# images, and IMAGE_DIR itself to remove one emptied.
+NOWRITE=$(find "$IMAGE_DIR" -maxdepth 1 -type d ! -writable 2>/dev/null | wc -l)
+if [ "$NOWRITE" -eq 0 ]; then
+    pass "image directories writable by $(id -un)"
+else
+    fail "image directories writable by $(id -un)" "$NOWRITE are not, and the reaper cannot delete from them.
+                                   find $IMAGE_DIR -maxdepth 1 -type d ! -writable"
+fi
+
+[ "${REAP_DRY_RUN:-1}" = 0 ] \
+    || printf 'NOTE  %-34s %s\n' "reaper in dry run" "deletes nothing; lists what it would in $RECORDS/would-delete.txt"
+
+# The reaper warns at each pass that leaves the disk above REAP_START_PCT.
+PCT=$(df --output=pcent "$IMAGE_DIR" 2>/dev/null | tail -1 | tr -dc 0-9)
+STILL=$(journalctl -t reaper --since '-30 min' -o cat --no-pager 2>/dev/null | grep '^still ' | tail -1)
+if [ "${PCT:-0}" -lt "$REAP_START_PCT" ]; then
+    pass "image disk" "${PCT}% used; the reaper starts at $REAP_START_PCT%"
+elif [ "${REAP_DRY_RUN:-1}" != 0 ]; then
+    fail "image disk" "${PCT}% used and the reaper is in dry run. Set REAP_DRY_RUN=0
+                                   in site.conf and re-run setup.sh."
+elif [ -n "$STILL" ]; then
+    fail "image disk" "the reaper reports: $STILL"
+else
+    pass "image disk" "${PCT}% used; the reaper deletes down to $REAP_STOP_PCT% at its next pass"
+fi
+
 fi
 
 # ======================================================== CONCORDIA ===========
@@ -182,6 +295,14 @@ for d in "$INCOMING_DIR" "$MANIFEST_DIR" "$LOCK_DIR"; do
         fail "$d" "missing"
     fi
 done
+
+# LOCK_DIR is on tmpfs, and this entry recreates it at every boot.
+if grep -q "^d $LOCK_DIR " /etc/tmpfiles.d/cryoscope.conf 2>/dev/null; then
+    pass "$LOCK_DIR recreated at boot"
+else
+    fail "$LOCK_DIR recreated at boot" "not in /etc/tmpfiles.d/cryoscope.conf, so every transfer
+                                   fails after the next reboot. Re-run setup.sh."
+fi
 
 # Take the lock the way the transfer paths do. A writable directory is not the
 # property that matters, and testing it passed while every transfer was failing.
@@ -241,8 +362,8 @@ head_ "Units"
 
 CROLE=$(cat "$CONFDIR/role" 2>/dev/null || echo unknown)
 case "$CROLE" in
-    active) WANT_ON="pull-images trigger-pull nginx"; WANT_OFF="spare-sync" ;;
-    spare)  WANT_ON=""; WANT_OFF="pull-images trigger-pull nginx" ;;
+    active) WANT_ON="pull-images trigger-pull nginx arrival-hash"; WANT_OFF="" ;;
+    spare)  WANT_ON=""; WANT_OFF="pull-images trigger-pull nginx arrival-hash" ;;
     *)      WANT_ON=""; WANT_OFF="" ;;
 esac
 
@@ -288,6 +409,22 @@ BACKSTOP=$(journalctl -t pull-images-cron --since "-25 hours" --no-pager 2>/dev/
            | grep -c 'to-check\|sending incremental' || true)
 printf 'NOTE  %-34s %s\n' "backstop activity, 24h" "${BACKSTOP:-0} logged lines (nonzero means the fast path is missing files)"
 
+head_ "Hash manifest"
+
+if [ "$CROLE" = spare ]; then
+    skip "every image hashed" "spare; arrival-hash runs on the active machine"
+elif [ -f "$MANIFEST_DIR/data.manifest" ]; then
+    N=$(unhashed "$INCOMING_DIR" "$MANIFEST_DIR/data.manifest")
+    if [ "$N" -eq 0 ]; then
+        pass "every image hashed" "$(wc -l < "$MANIFEST_DIR/data.manifest") lines in $MANIFEST_DIR/data.manifest"
+    else
+        fail "every image hashed" "$N older than 2 minutes not in $MANIFEST_DIR/data.manifest. After
+                                   downtime arrival-hash is catching up; run this again in a few minutes."
+    fi
+else
+    fail "every image hashed" "no $MANIFEST_DIR/data.manifest. journalctl -u arrival-hash -n 20 --no-pager"
+fi
+
 head_ "HTTP export"
 
 if [ "$CROLE" = spare ]; then
@@ -325,6 +462,21 @@ else
         pass "export is read-only"
     else
         fail "export is read-only" "limit_except is not taking effect"
+    fi
+
+    # cryocontrol deletes an image only when this manifest shows a matching copy.
+    if curl -s -f -I -m 5 "http://$MY_IP:$HTTP_PORT/manifests/data.manifest" >/dev/null 2>&1; then
+        pass "manifest served" "/manifests/data.manifest"
+    else
+        fail "manifest served" "cryocontrol verifies nothing and deletes nothing.
+                                   curl -I http://$MY_IP:$HTTP_PORT/manifests/data.manifest"
+    fi
+
+    if curl -s -o /dev/null -m 5 -w '%{http_code}' -X PUT \
+         "http://$MY_IP:$HTTP_PORT/manifests/probe" 2>/dev/null | grep -q '^40'; then
+        pass "manifest is read-only"
+    else
+        fail "manifest is read-only" "limit_except is not taking effect on /manifests/"
     fi
 fi
 
