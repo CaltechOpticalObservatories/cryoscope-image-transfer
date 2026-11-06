@@ -58,7 +58,7 @@ install_file() {
 # would otherwise fail the redirect and be reported as unchanged.
 install_src() {
     [ -s "$SRCDIR/$2" ] || die "$2 is missing or empty in $SRCDIR.
-       Copy the whole pipeline directory and run setup.sh from there."
+       Copy the whole image-transfer directory and run setup.sh from there."
     install_file "$1" "$3" < "$SRCDIR/$2"
 }
 
@@ -93,11 +93,11 @@ if [ "$SRCDIR" = /usr/local/bin ] || [ "$SRCDIR" = /usr/bin ]; then
        It is not meant to be installed. It installs role and check.sh from its
        own directory, so running it from the destination cannot work.
            sudo rm $SRCDIR/setup.sh
-           cd ~/Software/pipeline && ./setup.sh"
+           cd ~/Software/image-transfer && ./setup.sh"
 fi
 for f in $CONFFILE role check.sh; do
     [ -f "$SRCDIR/$f" ] || die "$f is not in $SRCDIR, beside setup.sh.
-       Copy the whole pipeline directory and run setup.sh from there."
+       Copy the whole image-transfer directory and run setup.sh from there."
 done
 ok "$CONFFILE, role and check.sh found beside setup.sh"
 

@@ -14,7 +14,7 @@
 # restarting the script.
 #
 # This is the behaviour an eavesdropper must implement. It is not part of the
-# image pipeline and nothing upstream depends on it.
+# image-transfer kit and nothing upstream depends on it.
 #
 #     ./eavesdrop.sh
 
