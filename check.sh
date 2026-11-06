@@ -210,7 +210,7 @@ if [ -z "$(systemctl show reaper -p ExecMainExitTimestamp --value 2>/dev/null)" 
 elif [ "$(systemctl show reaper -p Result --value 2>/dev/null)" = success ]; then
     pass "reaper last pass" "succeeded"
 else
-    fail "reaper last pass" "journalctl -u reaper -n 20 --no-pager"
+    fail "reaper last pass" "systemctl status reaper; journalctl -t reaper -n 20 --no-pager"
 fi
 LAST=$(journalctl -t reaper --since '-1 hour' -o cat --no-pager 2>/dev/null | grep '% used;' | tail -1)
 [ -n "$LAST" ] && printf 'NOTE  %-34s %s\n' "reaper last summary" "$LAST"
