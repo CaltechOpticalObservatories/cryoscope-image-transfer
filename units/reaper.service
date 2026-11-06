@@ -1,0 +1,9 @@
+[Unit]
+Description=Delete images verified on a concordia as the disk fills
+
+[Service]
+Type=oneshot
+User=user
+ExecStart=/usr/local/bin/reaper.sh
+Nice=19
+IOSchedulingClass=idle

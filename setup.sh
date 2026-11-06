@@ -164,10 +164,17 @@ fi
 . "$CONF"
 
 for v in CRYOCONTROL_IP CONCORDIA1_IP CONCORDIA2_IP MCAST_GROUP MCAST_PORT \
-         HTTP_PORT IMAGE_DIR INCOMING_DIR MANIFEST_DIR LOCK_DIR ACQ_MANIFEST; do
+         HTTP_PORT IMAGE_DIR INCOMING_DIR MANIFEST_DIR LOCK_DIR ACQ_MANIFEST \
+         REAP_DRY_RUN REAP_START_PCT REAP_STOP_PCT REAP_MIN_AGE_HOURS REAP_KEEP_NEWEST; do
     eval "val=\${$v:-}"
     [ -n "$val" ] || die "$v is empty in $CONF."
 done
+for v in REAP_START_PCT REAP_STOP_PCT REAP_MIN_AGE_HOURS REAP_KEEP_NEWEST; do
+    eval "val=\$$v"
+    case "$val" in *[!0-9]*) die "$v=$val in $CONF is not a whole number." ;; esac
+done
+[ "$REAP_STOP_PCT" -lt "$REAP_START_PCT" ] \
+    || die "REAP_STOP_PCT ($REAP_STOP_PCT) must be below REAP_START_PCT ($REAP_START_PCT) in $CONF."
 ok "address table complete"
 
 if [ -n "${EAVESDROPPERS:-}" ]; then
@@ -368,6 +375,27 @@ else ok "acq-hash.sh unchanged"; fi
 if install_src 644 units/acq-hash.service /etc/systemd/system/acq-hash.service
 then ok "wrote acq-hash.service"; mark_changed acq-hash
 else ok "acq-hash.service unchanged"; fi
+
+step "Reaper"
+
+if install_src 755 bin/reaper.sh /usr/local/bin/reaper.sh
+then ok "wrote /usr/local/bin/reaper.sh"
+else ok "reaper.sh unchanged"; fi
+
+if install_src 644 units/reaper.service /etc/systemd/system/reaper.service
+then ok "wrote reaper.service"
+else ok "reaper.service unchanged"; fi
+
+if install_src 644 units/reaper.timer /etc/systemd/system/reaper.timer
+then ok "wrote reaper.timer"; mark_changed reaper.timer
+else ok "reaper.timer unchanged"; fi
+
+if [ "$REAP_DRY_RUN" = 0 ]; then
+    ok "reaper deletes verified images from $REAP_START_PCT% used down to $REAP_STOP_PCT%"
+else
+    note "reaper is in dry run (REAP_DRY_RUN=$REAP_DRY_RUN) and deletes nothing.
+            It lists what it would delete in $(dirname "$ACQ_MANIFEST")/would-delete.txt."
+fi
 
 fi
 
@@ -697,6 +725,9 @@ if [ "$MACHINE_ROLE" = emitter ]; then
     sudo systemctl enable --now acq-hash >/dev/null 2>&1 \
         || die "acq-hash failed to start. journalctl -u acq-hash -n 20"
     ok "acq-hash enabled and running"
+    sudo systemctl enable --now reaper.timer >/dev/null 2>&1 \
+        || die "reaper.timer failed to start. systemctl status reaper.timer"
+    ok "reaper.timer enabled"
 fi
 
 if [ "$MACHINE_ROLE" = data ]; then
