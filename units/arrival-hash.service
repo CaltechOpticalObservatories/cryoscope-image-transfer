@@ -1,0 +1,14 @@
+[Unit]
+Description=SHA-256 manifest of arrived FITS images
+
+[Service]
+Type=simple
+User=user
+ExecStart=/usr/local/bin/arrival-hash.sh
+Restart=always
+RestartSec=5
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

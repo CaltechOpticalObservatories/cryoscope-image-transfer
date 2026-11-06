@@ -535,6 +535,17 @@ if install_src 644 units/trigger-pull.service /etc/systemd/system/trigger-pull.s
 then ok "wrote trigger-pull.service"; mark_changed trigger-pull
 else ok "trigger-pull.service unchanged"; fi
 
+step "Hash manifest"
+
+# Enabled by role on the active machine, not here.
+if install_src 755 bin/arrival-hash.sh /usr/local/bin/arrival-hash.sh
+then ok "wrote /usr/local/bin/arrival-hash.sh"; mark_changed arrival-hash
+else ok "arrival-hash.sh unchanged"; fi
+
+if install_src 644 units/arrival-hash.service /etc/systemd/system/arrival-hash.service
+then ok "wrote arrival-hash.service"; mark_changed arrival-hash
+else ok "arrival-hash.service unchanged"; fi
+
 step "Hourly backstop"
 
 # setup.sh creates this line and keeps its command text current. Whether it is
@@ -580,6 +591,14 @@ server {
         autoindex on;
         autoindex_format json;
         # limit_except is valid only inside a location block.
+        limit_except GET HEAD { deny all; }
+    }
+
+    # data.manifest, fetched by cryocontrol to check each copy before it deletes
+    # the original. Outside root, so it never appears in the listing the sweep
+    # reads.
+    location /manifests/ {
+        alias $MANIFEST_DIR/;
         limit_except GET HEAD { deny all; }
     }
 }
