@@ -767,8 +767,7 @@ say "   interface         $IFACE"
 say "   address           $MY_IP"
 [ "$MACHINE_ROLE" = data ] && say "   concordia role    ${CURRENT_ROLE:-unknown}"
 say ""
-say "   The transfer and notification layers are installed."
-say "   Retention and the cold-spare cycle are not built and not installed."
+say "   The transfer, notification, hashing and retention layers are installed."
 
 if [ "$DEFERRED" -eq 1 ]; then
     say ""

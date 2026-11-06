@@ -89,9 +89,6 @@ fi
 if [ "${MACHINE_ROLE:-}" = data ]; then
     CROLE=$(cat "$CONFDIR/role" 2>/dev/null || echo unknown)
     pass "concordia role" "$CROLE"
-    if [ -f "$CONFDIR/degraded" ]; then
-        printf 'NOTE  %-34s %s\n' "degraded mode" "SET. Deletion is authorized against a single copy."
-    fi
 fi
 
 # ------------------------------------------------------------------- naming --

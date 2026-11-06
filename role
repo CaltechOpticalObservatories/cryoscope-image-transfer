@@ -5,9 +5,6 @@
 #     role              report the current role
 #     role active       become the data computer
 #     role spare        become the cold spare
-#     role active --degraded
-#                       failover: become the data computer with only one copy
-#                       of the archive
 #
 # Failover is manual. There is no automatic promotion, no heartbeat and no
 # quorum. This command performs the whole transition in one step.
@@ -17,13 +14,9 @@ set -u
 CONFDIR=/etc/cryoscope
 CONFFILE=site.conf
 ROLE_FILE=$CONFDIR/role
-DEGRADED_FLAG=$CONFDIR/degraded
 
 # Units that define the active data computer.
-ACTIVE_UNITS="pull-images trigger-pull nginx"
-# Retention units, installed later. Absent units are skipped.
-ACTIVE_PARTB="arrival-hash spare-cycle.timer"
-SPARE_PARTB="spare-sync"
+ACTIVE_UNITS="pull-images trigger-pull nginx arrival-hash"
 
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '   ok       %s\n' "$*"; }
@@ -53,8 +46,8 @@ disable_unit() {
 }
 
 # The hourly backstop is a crontab line, not a unit, and belongs to the active
-# role. On a spare it would rsync from cryocontrol every hour; the spare's copy
-# comes one-way from the active machine and from nowhere else.
+# role. On a spare it would rsync from cryocontrol every hour; the cold spare
+# takes nothing until it is made active.
 #
 # Disabling comments the line rather than deleting it, so the installed command
 # survives a demotion and promotion unchanged.
@@ -96,9 +89,8 @@ sudo -n true 2>/dev/null || sudo true || die "user needs sudo rights."
 if [ $# -eq 0 ]; then
     CUR=$(cat "$ROLE_FILE" 2>/dev/null || echo unknown)
     say "role: $CUR on $(hostname)"
-    [ -f "$DEGRADED_FLAG" ] && say "      DEGRADED MODE IS SET. Deletion is authorized against a single copy."
     say ""
-    for u in $ACTIVE_UNITS $ACTIVE_PARTB $SPARE_PARTB; do
+    for u in $ACTIVE_UNITS; do
         unit_exists "$u" || continue
         printf '   %-20s %-9s %s\n' "$u" \
             "$(systemctl is-enabled "$u" 2>/dev/null)" \
@@ -114,13 +106,7 @@ fi
 
 WANT=$1
 shift
-DEGRADED=0
-for arg in "$@"; do
-    case "$arg" in
-        --degraded) DEGRADED=1 ;;
-        *) die "unknown argument '$arg'" ;;
-    esac
-done
+[ $# -eq 0 ] || die "unknown argument '$1'"
 
 # ------------------------------------------------------------------ active --
 
@@ -130,46 +116,25 @@ active)
     say ""
 
     # Single emitter rule. Two active machines double the read load on
-    # cryocontrol and duplicate every IMAGE_AVAILABLE datagram. Advisory only:
-    # the other machine may legitimately be dead.
+    # cryocontrol and duplicate every IMAGE_AVAILABLE datagram. nginx runs on
+    # the active machine only, and each concordia's firewall admits the other
+    # on HTTP_PORT. Advisory only: the other machine may legitimately be dead.
     case "$(hostname)" in
-        concordia1) OTHER=concordia2 ;;
-        concordia2) OTHER=concordia1 ;;
+        concordia1) OTHER=concordia2; OTHER_IP=$CONCORDIA2_IP ;;
+        concordia2) OTHER=concordia1; OTHER_IP=$CONCORDIA1_IP ;;
         *) OTHER="" ;;
     esac
     if [ -n "$OTHER" ]; then
-        if ssh -o BatchMode=yes -o ConnectTimeout=5 "$OTHER" \
-             'systemctl is-enabled --quiet pull-images' 2>/dev/null; then
-            warn "$OTHER still has pull-images enabled. Run 'role spare' there, or
-            confirm it is dead, before relying on this machine."
-        elif ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$OTHER" true 2>/dev/null; then
-            note "$OTHER is unreachable, so this check was not made. If it is
-            alive and still active, two machines will pull from cryocontrol."
+        if curl -s -o /dev/null --connect-timeout 3 -m 5 "http://$OTHER_IP:$HTTP_PORT/" 2>/dev/null; then
+            warn "$OTHER answers on port $HTTP_PORT, so it is still active. Run
+            'role spare' there, or power it off, before relying on this machine."
         else
-            ok "$OTHER is not active"
+            ok "$OTHER does not answer on port $HTTP_PORT: spare or off"
         fi
     fi
 
-    # Disabled first. A promoted machine that still runs the spare cycle
-    # powers itself off when its sync finishes.
-    disable_unit "$SPARE_PARTB"
-
     for u in $ACTIVE_UNITS; do enable_unit "$u"; done
-    for u in $ACTIVE_PARTB;  do enable_unit "$u"; done
     cron_backstop on
-
-    if [ "$DEGRADED" -eq 1 ]; then
-        sudo install -d -m 755 "$CONFDIR"
-        printf 'set %s by role on %s\n' "$(date -Is)" "$(hostname)" \
-            | sudo tee "$DEGRADED_FLAG" >/dev/null
-        warn "DEGRADED MODE SET."
-        say  "            Deletion on cryocontrol is authorized on one copy: a"
-        say  "            name in data.manifest alone. Hashes are still checked."
-        say  "            There is no backup until a second machine is restored."
-    elif [ -f "$DEGRADED_FLAG" ]; then
-        note "degraded flag is already set and is left alone. Remove it once a
-            second machine is back:  sudo rm $DEGRADED_FLAG"
-    fi
 
     echo active | sudo tee "$ROLE_FILE" >/dev/null
     say ""
@@ -190,12 +155,7 @@ spare)
     say ""
 
     for u in $ACTIVE_UNITS; do disable_unit "$u"; done
-    for u in $ACTIVE_PARTB;  do disable_unit "$u"; done
     cron_backstop off
-
-    # The spare's whole job: boot, sync from the active machine, hash, shut
-    # down. Not built yet.
-    enable_unit "$SPARE_PARTB"
 
     echo spare | sudo tee "$ROLE_FILE" >/dev/null
     say ""
@@ -204,7 +164,7 @@ spare)
     ;;
 
 *)
-    die "usage: role [active|spare] [--degraded]"
+    die "usage: role [active|spare]"
     ;;
 esac
 
