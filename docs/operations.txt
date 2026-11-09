@@ -1,0 +1,376 @@
+================================================================================
+CRYOSCOPE IMAGE TRANSFER -- OPERATIONS
+David Hale <dhale@astro.caltech.edu>
+Revision 2
+================================================================================
+
+How to install, run, check and repair image transfer and retention on site.
+
+Every command runs as the account user. Commands that need root say sudo.
+Always run setup.sh with bash: a copy of the kit can lose the execute bit.
+A word in capitals inside a command, such as NAME or DRIVE, stands for a value
+you fill in.
+
+HOW IT WORKS
+
+The camera on cryocontrol writes each image into /images. concordia1 copies it
+within a second, and keeps every image for good. Programs on both machines
+record a fingerprint (SHA-256 hash) of every image. When cryocontrol's disk
+fills, the reaper deletes its oldest images, but only those whose fingerprint
+on concordia1 matches cryocontrol's, so nothing is deleted that is not safely
+copied. concordia2 is a spare, kept off until concordia1 fails. Other machines,
+such as cryostep, are told of each new image and fetch it from concordia1.
+check.sh reports whether all of this is working.
+
+    cryocontrol                         concordia1
+    /images  ----------(1)---------->   /data/incoming  ----(2)---->  cryostep
+       |                                      |
+    acq-hash (3)                         arrival-hash (3)
+       |                                      |
+    acq.manifest (4) <------(5)-------  data.manifest (4)
+       |
+    reaper (6)
+
+    (1) cryocontrol announces each new image on the network (multicast), and
+        concordia1 pulls it at once with rsync over SSH. concordia1 also
+        pulls every 3 seconds and every hour, so an image whose announcement
+        is lost still arrives.
+    (2) concordia1 announces each image it now holds. cryostep, and any other
+        machine listed as an eavesdropper in site.conf, may fetch it from
+        concordia1 over HTTP.
+    (3) acq-hash on cryocontrol and arrival-hash on concordia1 each look for
+        new images every 30 seconds and compute each one's fingerprint
+        (SHA-256 hash). Two copies with the same fingerprint are identical.
+    (4) a manifest is a text file the hash program adds one line to per image:
+        its name, fingerprint, size in bytes and the time it was hashed.
+        acq.manifest is in /var/lib/cryoscope, data.manifest in /data/manifests.
+    (5) the reaper fetches data.manifest from concordia1 over HTTP and compares
+        it with acq.manifest, image by image.
+    (6) when cryocontrol:/images fills, the reaper deletes from cryocontrol the
+        oldest images whose fingerprints match in both manifests. No program
+        here ever deletes anything on concordia1.
+
+
+--------------------------------------------------------------------------------
+1. INSTALLING ON SITE
+--------------------------------------------------------------------------------
+
+  1. Power on all three machines. Give each its fixed site address, if it does
+     not have it yet (Settings > Network, manual), and confirm with ip -4 addr.
+     setup.sh checks each machine's address against site.conf.
+
+  2. On cryocontrol, with the flash drive mounted (Ubuntu shows it under
+     /media/user/; DRIVE below is its label), check the kit, unpack it, set
+     the addresses, and put the edited file back on the drive:
+
+         cd /media/user/DRIVE
+         sha256sum -c image-transfer.tar.sha256
+         mkdir -p ~/Software/image-transfer
+         tar -xf image-transfer.tar -C ~/Software/image-transfer
+         nano ~/Software/image-transfer/site.conf
+         cp ~/Software/image-transfer/site.conf /media/user/DRIVE/
+
+     In site.conf set CRYOCONTROL_IP, CONCORDIA1_IP, CONCORDIA2_IP, and
+     EAVESDROPPERS, which is addresses separated by spaces inside double
+     quotes, or "" for none.
+
+  3. On concordia1 and concordia2, the same, taking site.conf from the drive:
+
+         cd /media/user/DRIVE
+         sha256sum -c image-transfer.tar.sha256
+         mkdir -p ~/Software/image-transfer
+         tar -xf image-transfer.tar -C ~/Software/image-transfer
+         cp /media/user/DRIVE/site.conf ~/Software/image-transfer/
+
+  4. On cryocontrol, then concordia1, then concordia2:
+
+         cd ~/Software/image-transfer && bash setup.sh
+
+     A concordia keeps the role it already has. If setup.sh stops, its last
+     lines say why; fix that and run it again. Running it again is always
+     safe.
+
+  5. check.sh on each machine. Every line must be PASS, SKIP or NOTE, except
+     that "every image hashed" can fail for a while after the first install,
+     while the images already there are hashed; run it again later. Then,
+     between exposures, check.sh --transfer on concordia1.
+
+  6. On concordia2, which is the cold spare:
+
+         sudo poweroff
+
+The reaper starts in dry run. Nothing is deleted until section 3 is done.
+
+
+--------------------------------------------------------------------------------
+2. CHECKING
+--------------------------------------------------------------------------------
+
+Nothing needs doing for transfer or retention to run. To see that they are
+working, run one command on cryocontrol and on the active concordia
+(concordia1, or concordia2 after a failover):
+
+    check.sh
+
+Once a day is enough. Nothing raises an alarm by itself, so this is how a
+problem is found before the disk fills. If every line is PASS, SKIP or NOTE,
+there is nothing to do.
+
+A FAIL line says what is wrong. The ones particular to retention, on
+cryocontrol, and what to do about each:
+
+    every image hashed        acq-hash is behind. Normal for a few minutes
+                              after a restart; otherwise
+                              systemctl status acq-hash.
+    reaper last pass          the reaper failed. systemctl status reaper, and
+                              journalctl -t reaper -n 20.
+    concordia manifest        no concordia serves data.manifest, so nothing
+      reachable               is verified and nothing is deleted. Run check.sh
+                              on the active concordia; it shows why.
+    no hash mismatches        section 4.
+    image directories         the reaper cannot delete from a directory. Run
+      writable by user        the find command it prints, then
+                              sudo chown -R user:user on each directory listed.
+    image disk                above REAP_START_PCT and either in dry run
+                              (section 3) or unable to free enough (see the
+                              warning below).
+
+On the active concordia:
+
+    every image hashed        arrival-hash is behind. Normal for a few minutes
+                              after a restart; otherwise
+                              systemctl status arrival-hash.
+    manifest served           nginx is not serving data.manifest, so
+                              cryocontrol deletes nothing until it is.
+    /var/lock/pull-images     run bash setup.sh again.
+      recreated at boot
+
+NOTE  reaper last summary is the last pass in one line:
+
+    80% used; 51 images, 50 verified, 1 mismatched; manifests from: 10.0.0.11;
+    deleted 13 images, 54525952 bytes; now 60% used
+
+When a pass leaves the disk above REAP_START_PCT, the reaper logs a warning:
+
+    still 80% used: 12 images here are not verified on any concordia, and 1000
+    newest and any under 24 hours old are kept
+
+A large count of images not verified means the transfer or arrival-hash on the
+concordia is behind or stopped. Otherwise the images left are too young or too
+new to delete; if that persists for days, the thresholds do not fit the disk
+(section 3, Thresholds). It never deletes an unverified image to make room.
+
+    journalctl -t reaper --since today      every pass today
+
+
+--------------------------------------------------------------------------------
+3. TURNING ON DELETION
+--------------------------------------------------------------------------------
+
+The reaper is installed in dry run. It runs by itself every 10 minutes, works
+out what it would delete, and deletes nothing. It lists nothing until the disk
+reaches REAP_START_PCT (75% as shipped), so do this once df -h /images shows
+the disk at or past that. check.sh fails "image disk" when the disk reaches that
+point in dry run, so that FAIL is the signal to do this. On cryocontrol:
+
+  1. Read what the reaper would delete, oldest first:
+
+         cat /var/lib/cryoscope/would-delete.txt
+
+  2. Pick two or three lines from it. NAME is the first word on a line, such
+     as 20261203/img_0001.fits. Compare the copies:
+
+         sha256sum /images/NAME                       (cryocontrol)
+         sha256sum /data/incoming/NAME                (the active concordia)
+
+     The two sums and the hash on the line must all be the same.
+
+  3. On cryocontrol, set REAP_DRY_RUN=0 in ~/Software/image-transfer/site.conf
+     and run bash setup.sh.
+
+  4. Only cryocontrol uses this setting, so deletion does not need this step.
+     It keeps the copies identical. On the active concordia:
+
+         scp cryocontrol:Software/image-transfer/site.conf ~/Software/image-transfer/
+         cd ~/Software/image-transfer && bash setup.sh
+
+     The spare gets it when it is next powered on (section 5).
+
+From then on every deletion is appended to /var/lib/cryoscope/deleted.txt:
+name, hash, size and time. To stop deleting, set REAP_DRY_RUN=1 the same way.
+
+Thresholds
+
+    REAP_START_PCT      deletion starts at this much of the disk used
+    REAP_STOP_PCT       and stops here
+    REAP_MIN_AGE_HOURS  nothing younger is deleted
+    REAP_KEEP_NEWEST    the newest this many images are never deleted
+
+Change them the same way as REAP_DRY_RUN. Images younger than
+REAP_MIN_AGE_HOURS are never deleted, so a day's images must fit between
+REAP_START_PCT and full. On a 600 GB disk at 75%, that is 150 GB. To see how
+much one night took, and how full the disk is:
+
+    du -sh /images/20261203
+    df -h /images
+
+setup.sh stops on a value that is not a whole number, or on REAP_STOP_PCT not
+below REAP_START_PCT. A REAP_START_PCT set too high leaves no room for a
+night's images.
+
+
+--------------------------------------------------------------------------------
+4. A HASH MISMATCH
+--------------------------------------------------------------------------------
+
+check.sh fails "no hash mismatches". On cryocontrol:
+
+    journalctl -t reaper -p err
+
+It prints a line like this for each:
+
+    MISMATCH NAME here SHA BYTES, at ADDRESS SHA BYTES
+
+NAME is the image, the word after MISMATCH. ADDRESS is the concordia holding
+the copy that differs from the image as cryocontrol hashed it. The reaper keeps
+that image on cryocontrol for good. Find which copy is wrong:
+
+    sha256sum /images/NAME                                  (cryocontrol)
+    grep "^NAME " /var/lib/cryoscope/acq.manifest           (cryocontrol)
+    sha256sum /data/incoming/NAME                           (the concordia)
+
+If cryocontrol's file still matches acq.manifest, the concordia's copy is
+damaged. Replace it, on the concordia:
+
+    sudo systemctl stop arrival-hash
+    rm /data/incoming/NAME
+    sha256sum /data/incoming/NAME        repeat until the file is back and
+                                         its hash matches cryocontrol's; the
+                                         3 second pull copies it again
+    cd /data/manifests
+    awk -v n=NAME '$1 != n' data.manifest > data.manifest.new
+    mv data.manifest.new data.manifest
+    sudo systemctl start arrival-hash
+
+and then on cryocontrol clear the record:
+
+    cd /var/lib/cryoscope
+    awk -v n=NAME '$1 != n' mismatch.txt > mismatch.txt.new
+    mv mismatch.txt.new mismatch.txt
+
+The next reaper pass compares the new copy. If it matches, the image is
+verified like any other.
+
+If cryocontrol's own file no longer matches acq.manifest, the original changed
+after it was written. Leave it: the reaper never deletes it, and the record
+stays as the evidence.
+
+
+--------------------------------------------------------------------------------
+5. FAILOVER TO concordia2
+--------------------------------------------------------------------------------
+
+When concordia1 has failed (check.sh on cryocontrol fails "concordia manifest
+reachable", and concordia1 does not respond):
+
+  1. Power concordia2 on.
+  2. On concordia2, take the current site.conf and run setup.sh:
+
+         scp cryocontrol:Software/image-transfer/site.conf ~/Software/image-transfer/
+         cd ~/Software/image-transfer && bash setup.sh
+
+  3. On concordia2:
+
+         role active
+
+     It warns if concordia1 still answers on the HTTP port. If concordia1 is
+     running at all, power it off or run role spare on it.
+
+  4. Ask cryostep's operator to point the 30 second sweep at
+     http://concordia2:8080/. Notified fetches follow on their own.
+  5. check.sh and check.sh --transfer on concordia2.
+
+The reaper on cryocontrol reads concordia2's data.manifest from its next pass;
+nothing on cryocontrol changes. concordia2 pulls every image still on
+cryocontrol. Images deleted from cryocontrol before the failover are only on
+concordia1's disk.
+
+concordia2 then stays active. Making concordia1 active again would leave out
+every image concordia2 received and the reaper has since deleted.
+
+When concordia1 is repaired, boot it with its network cable unplugged, run
+role spare, then plug it in and sudo poweroff. It is the cold spare. It still
+records itself as active and starts as active, which the unplugged cable keeps
+harmless until role spare. If it was rebuilt instead (section 8), run bash
+setup.sh and then role spare at once; setup.sh makes it active first and warns
+that concordia2 answers.
+
+
+--------------------------------------------------------------------------------
+6. RESTARTS AND POWER CUTS
+--------------------------------------------------------------------------------
+
+Nothing to do. Every service starts at boot and the lock directory is recreated
+before them. acq-hash and arrival-hash catch up on whatever arrived while they
+were down, and the reaper's first pass is 5 minutes after boot. To confirm,
+run check.sh once everything is up.
+
+
+--------------------------------------------------------------------------------
+7. FILES
+--------------------------------------------------------------------------------
+
+cryocontrol, /var/lib/cryoscope
+    acq.manifest      NAME SHA256 BYTES TIME for every image, as written
+    mismatch.txt      NAME, both hashes and sizes, the concordia, the time
+    deleted.txt       NAME SHA256 BYTES TIME for every image deleted
+    would-delete.txt  in dry run, NAME SHA256 BYTES the next live pass would
+                      delete
+
+concordia, /data/manifests
+    data.manifest     NAME SHA256 BYTES TIME for every image arrived. Served to
+                      cryocontrol at http://ADDRESS:8080/manifests/data.manifest
+
+Logs
+    journalctl -t reaper          cryocontrol, one summary per pass
+    journalctl -t acq-hash        cryocontrol, only an image it could not read
+    journalctl -t arrival-hash    concordia, only an image it could not read
+    journalctl -t trigger-pull    concordia, one line per notified image
+
+    Use -t, as here. These lines are written by logger, and journalctl -u
+    misses some or all of them. Whether a service is running at all:
+
+    systemctl status reaper       (or acq-hash, arrival-hash, trigger-pull)
+
+
+--------------------------------------------------------------------------------
+8. A MACHINE BUILT FROM SCRATCH
+--------------------------------------------------------------------------------
+
+The three machines arrive ready for section 1. A machine rebuilt from a fresh
+Ubuntu install needs these done by hand first, and then section 1, steps 2 to
+4.
+
+  1. Name it cryocontrol, concordia1 or concordia2, then log out and in:
+
+         sudo hostnamectl set-hostname NAME
+
+     setup.sh chooses what to install by the hostname and stops on any other.
+
+  2. One account named user, with sudo. setup.sh stops if run as root or as
+     any other account.
+
+  3. Its fixed site address, as in section 1, step 1. If the machine has more
+     than one network connection with an address, setup.sh stops and prints
+     the command that tells it which one to use.
+
+  4. On a concordia, /data mounted from the storage array. setup.sh warns but
+     carries on if it is not, and the archive then fills the system disk.
+
+  5. On a concordia, its SSH key on cryocontrol. setup.sh makes a key if there
+     is none, and when SSH to cryocontrol fails it prints the ssh-copy-id
+     command that installs the key. Run that command, then bash setup.sh again.
+
+  6. The clocks of all three machines agree. Nothing here checks or sets them.
+
+================================================================================
